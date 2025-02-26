@@ -3,14 +3,15 @@ from dataclasses import dataclass, replace
 from collections import defaultdict
 from typing import Optional, Any, Iterator, Generator
 import multiprocessing, importlib, inspect, functools, pathlib, os, ctypes, ctypes.util, platform, contextlib, sys, re, atexit, pickle, decimal, time
+import itertools, concurrent.futures as cf
 from tinygrad.helpers import CI, OSX, LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, flat_mv, from_mv, PROFILE, temp, mv_address, \
-                             cpu_time_execution, colored, Context, round_up
+                             cpu_time_execution, drain, colored, Context, round_up
 from tinygrad.dtype import DType, ImageDType, PtrDType, dtypes
 from tinygrad.renderer import Renderer
 
 # **************** Device ****************
 
-ALL_DEVICES = ["METAL", "AMD", "NV", "CUDA", "QCOM", "GPU", "CPU", "LLVM", "DSP", "WEBGPU"]
+ALL_DEVICES = ["METAL", "AMD", "NV", "CUDA", "QCOM", "GPU", "CLANG", "LLVM", "DSP", "WEBGPU"]
 class _Device:
   def __init__(self) -> None:
     self._devices = [x.stem[len("ops_"):].upper() for x in (pathlib.Path(__file__).parent/"runtime").iterdir() if x.stem.startswith("ops_")]
@@ -226,23 +227,30 @@ MallocAllocator = _MallocAllocator()
 # NOTE: MAP_JIT is added to mmap module in python 3.13
 MAP_JIT = 0x0800
 
+def abi_fixup(args):
+  # NOTE: replace this by --target={host's triple}-elf in clang args once we only support macos sequoia and later.
+  # Apple relaxes abi requirement for stack arguments to always be at least 8 byte aligned on arm64
+  # https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
+  # This hack is required because clang/llvm bug doesn't allow us to just use {host's triple}+'-elf' (relocation failures)
+  # The bug was fixed in https://github.com/llvm/llvm-project/commit/454cc36630296262cdb6360b60f90a64a97f7f1a but was only backported to xcode 16+
+  return (args[:8] + [ctypes.c_int64(a) if isinstance(a, int) else a for a in args[8:]]) if platform.machine() == "arm64" and OSX else args
+
 # CPUProgram is a jit/shellcode program that can be just mmapped and jumped to
 class CPUProgram:
   rt_lib = ctypes.CDLL(ctypes.util.find_library('System' if OSX else 'kernel32') if OSX or sys.platform == "win32" else 'libgcc_s.so.1')
   atomic_lib = ctypes.CDLL(ctypes.util.find_library('atomic')) if sys.platform == "linux" else None
+  ncpus = os.cpu_count() or 1
+  threadpool = cf.ThreadPoolExecutor(ncpus)
 
   def __init__(self, name:str, lib:bytes):
     if sys.platform == "win32":
       PAGE_EXECUTE_READWRITE = 0x40
       MEM_COMMIT =  0x1000
       MEM_RESERVE = 0x2000
-      ctypes.windll.kernel32.VirtualAlloc.restype = ctypes.c_void_p
-      self.mem = ctypes.windll.kernel32.VirtualAlloc(ctypes.c_void_p(0), ctypes.c_size_t(len(lib)), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
-      ctypes.memmove(self.mem, lib, len(lib))
-      ctypes.windll.kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-      proc = ctypes.windll.kernel32.GetCurrentProcess()
-      ctypes.windll.kernel32.FlushInstructionCache(ctypes.c_void_p(proc), ctypes.c_void_p(self.mem), ctypes.c_size_t(len(lib)))
-      self.fxn = ctypes.CFUNCTYPE(None)(self.mem)
+      ctypes.windll.kernel32.VirtualAlloc.restype = ctypes.c_uint64
+      ptr = ctypes.windll.kernel32.VirtualAlloc(ctypes.c_int(0), ctypes.c_int(len(lib)), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+      ctypes.memmove(ptr, lib, len(lib))
+      self.fxn = ctypes.CFUNCTYPE(None)(ptr)
     else:
       from mmap import mmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_ANON, MAP_PRIVATE
       # On apple silicon with SPRR enabled (it always is in macos) RWX pages are unrepresentable: https://blog.svenpeter.dev/posts/m1_sprr_gxf/
@@ -261,18 +269,9 @@ class CPUProgram:
 
       self.fxn = ctypes.CFUNCTYPE(None)(mv_address(self.mem))
 
-  def __call__(self, *bufs, vals=(), wait=False):
-    args = list(bufs) + list(vals)
-    # NOTE: replace this by --target={host's triple}-elf in clang args once we only support macos sequoia and later.
-    # Apple relaxes abi requirement for stack arguments to always be at least 8 byte aligned on arm64
-    # https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
-    # This hack is required because clang/llvm bug doesn't allow us to just use {host's triple}+'-elf' (relocation failures)
-    # The bug was fixed in https://github.com/llvm/llvm-project/commit/454cc36630296262cdb6360b60f90a64a97f7f1a but was only backported to xcode 16+
-    if platform.machine() == "arm64" and OSX: args = args[:8] + [ctypes.c_int64(a) if isinstance(a, int) else a for a in args[8:]]
-    return cpu_time_execution(lambda: self.fxn(*args), enable=wait)
-
-  def __del__(self):
-    if sys.platform == 'win32': ctypes.windll.kernel32.VirtualFree(ctypes.c_void_p(self.mem), ctypes.c_size_t(0), 0x8000) #0x8000 - MEM_RELEASE
+  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), vals=(), wait=False):
+    futures = [self.threadpool.submit(self.fxn, *abi_fixup([*bufs, *vals, *pos])) for pos in itertools.product(*map(range, global_size))]
+    return cpu_time_execution(lambda: drain(cf.as_completed(futures)), wait)
 
 # **************** for Compiled Devices ****************
 
